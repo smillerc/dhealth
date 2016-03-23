@@ -1,44 +1,69 @@
 # -*- coding: utf-8 -*-
-from __future__ import division, print_function  # python 2/3 interoperability
-import numpy as np
-from datetime import datetime
-import time
+from __future__ import division, print_function
+
 import sys
+import os
+import time
+from datetime import datetime
+
+import numpy as np
+from numba import jit
+import pyopencl as cl
+import pyopencl.array
+import opencl_algorithms as cl_algorithms
+from pyopencl.elementwise import ElementwiseKernel
 
 # Ensure that Python 3.5 is used
-assert sys.version_info >= (3, 5)
+assert sys.version_info >= (3, 5), "Python 3.5 is required..."
 
 
-class GPUTiming:
+os.environ['PYOPENCL_COMPILER_OUTPUT'] = '0'
+
+
+class DeviceTiming:
     def __init__(self, name=None):
         """
         Simple class to make it easier to display timing for each kernel
         :param name: Name of the gpu function/kernel/etc...
         """
 
-        self.host_to_device = 0.0
-        self.device_to_host = 0.0
-        self.kernel_run_time = 0.0
-        self.init_on_device = 0.0
+        self.host_to_device = np.nan
+        self.device_to_host = np.nan
+        self.kernel_run_time = np.nan
+        self.init_on_device = np.nan
         self.kernel_name = name
-        self.total_time = 0.0
+        self.total_time = np.nan
+        self.total_transfer_time = np.nan
+
+    def get_transfer_times(self):
+        self.total_transfer_time = np.nansum([self.device_to_host,
+                                              self.host_to_device])
+        return self.total_transfer_time
+
+    def get_total(self):
+        self.total_time = np.nansum([self.init_on_device,
+                                     self.device_to_host,
+                                     self.host_to_device,
+                                     self.kernel_run_time])
+        return self.total_time
 
     def print_timings(self):
-        print("GPU Function:", self.kernel_name)
-        print("Init on Device: \t\t\t{0:.5f} seconds".format(
-            self.init_on_device))
-        print("Host to Device: \t\t\t{0:.5f} seconds".format(
-            self.host_to_device))
-        print("Kernel Runtime: \t\t\t{0:.5f} seconds".format(
-            self.kernel_run_time))
-        print("Device to Host: \t\t\t{0:.5f} seconds".format(
-            self.device_to_host))
+        print("Device Function:", self.kernel_name)
+
+        if self.init_on_device is not np.nan:
+            print("Init on Device: \t\t\t{0:.5f} seconds".format(
+                self.init_on_device))
+        if self.host_to_device is not np.nan:
+            print("Host to Device: \t\t\t{0:.5f} seconds".format(
+                self.host_to_device))
+        if self.kernel_run_time is not np.nan:
+            print("Kernel Runtime: \t\t\t{0:.5f} seconds".format(
+                self.kernel_run_time))
+        if self.device_to_host is not np.nan:
+            print("Device to Host: \t\t\t{0:.5f} seconds".format(
+                self.device_to_host))
         print("\t\t\t\t\t---------------")
-        print("Total: \t\t\t\t\t{0:.5f} seconds".format(
-            self.init_on_device +
-            self.device_to_host +
-            self.host_to_device +
-            self.kernel_run_time))
+        print("Total: \t\t\t\t\t{0:.5f} seconds".format(self.get_total()))
         print()
         print()
 
@@ -50,7 +75,9 @@ class Lead:
                  samples=None,
                  resolution=None,
                  sample_rate=None,
-                 time_series=None):
+                 time_series=None,
+                 cl_device_type=None,
+                 profile=False):
         """
 
         :param lead_number:
@@ -59,6 +86,7 @@ class Lead:
         :param resolution:
         :param sample_rate: Sampling rate of the lead
         :param time_series: Time corresponding to signal data
+        :param profile: Turn on profiling (True/False)
         :return:
         """
 
@@ -71,6 +99,7 @@ class Lead:
         self.rr_peaks = None
         self.voltage_first_derivative = None
         self.voltage_second_derivative = None
+        self.profile = profile
 
         # Array the holds the time increments as numpy datetime format
         self.time = time_series
@@ -79,6 +108,37 @@ class Lead:
 
         # Index of the first r peak
         self.first_r_peak_index = None
+
+        self.cl_context = None
+        self.cl_queue = None
+
+        platform = cl.get_platforms()[0]
+
+        gpu_device = platform.get_devices(cl.device_type.GPU)
+        cpu_device = platform.get_devices(cl.device_type.CPU)
+        accel_device = platform.get_devices(cl.device_type.ACCELERATOR)
+
+        if cl_device_type is None:
+            self.cl_context = cl.Context(gpu_device)
+            # print("Defaulting to run on the GPU")
+            # print("Device:", gpu_device)
+
+        elif cl_device_type.lower() is 'cpu':
+            self.cl_context = cl.Context(cpu_device)
+            # print("Running on the CPU")
+            # print("Device:", cpu_device)
+
+        elif cl_device_type.lower() is 'accelerator':
+            self.cl_context = cl.Context(accel_device)
+            # print("Running on an Accelerator Device")
+            # print("Device:", accel_device)
+
+        # Create the OpenCL Queue
+        if self.profile:
+            self.cl_queue = cl.CommandQueue(self.cl_context,
+                                            properties=cl.command_queue_properties.PROFILING_ENABLE)
+        else:
+            self.cl_queue = cl.CommandQueue(self.cl_context)
 
     def get_first_r_peak_index(self):
         """
@@ -98,352 +158,174 @@ class Lead:
         print("Computing derivative for lead", lead_number, "on the cpu...")
 
         voltage_data = (self.voltage_data *
-                       (self.resolution / 1000000.0)).astype(np.float32)
+                        (self.resolution / 1000000.0)).astype(np.float32)
 
         dx = self.samples / self.sample_rate / self.samples
 
         self.voltage_first_derivative = np.diff(voltage_data) / dx
 
-    def compute_first_deriv_gpu(self, transfer_to_host=False):
-        """
-        Send the raw lead voltages to the gpu and calculate the 1st derivative
-        :param transfer_to_host: True/False to transfer dfdx to the cpu
-        :return: gpuarray of derivatives (still on gpu), and GPUTiming object
+    def compute_first_deriv_device(self, transfer_to_host=False,
+                                   cl_queue=None,
+                                   cl_context=None):
         """
 
-        # Try to import the pyCUDA module
-        try:
-            from pycuda import driver, compiler, gpuarray, tools, cumath
-            import pycuda.autoinit
-            from pycuda.compiler import SourceModule
+        :param transfer_to_host:
+        :param cl_queue:
+        :param cl_context:
+        :return:
+        """
 
-        except ImportError:
-            print("Error: Unable to import the pyCUDA package")
-            return
+        if cl_queue is None:
+            cl_queue = self.cl_queue
+        if cl_context is None:
+            cl_context = self.cl_context
 
-        module = SourceModule(
-            """
-            // Simple gpu kernel to compute the derivative
-            // with a constant dx (using shared memory)
-            __global__ void dfdx_shared(float* f,
-                                        float* f_shifted,
-                                        float* dfdx,
-                                        float dx,
-                                        int n)
-            {
-                unsigned int g_i = blockIdx.x * blockDim.x + threadIdx.x;
-                unsigned int s_i = threadIdx.x;
-
-                __shared__ float shared_dx;
-                __shared__ float shared_f[512];
-                __shared__ float shared_f_shifted[512];
-
-                // Assigned to shared memory
-                shared_dx = dx;
-                shared_f[s_i] = f[g_i];
-                shared_f_shifted[s_i] = f_shifted[g_i];
-
-                __syncthreads();
-
-                dfdx[g_i] = (shared_f_shifted[s_i] - shared_f[s_i]) / shared_dx;
-            }
-            """)
+        if self.profile:
+            timing = DeviceTiming("1st Derivative - OpenCL")
 
         voltage_data = (self.voltage_data *
-                       (self.resolution / 1000000.0)).astype(np.float32)
+                        (self.resolution / 1000000.0)).astype(np.float32)
 
         dx = self.samples / self.sample_rate / self.samples
-        n = self.voltage_data[2:].size
-        alpha = np.float32(1.0 / dx ** 2)
 
-        start_t_gpu = driver.Event()
-        end_t_gpu = driver.Event()
+        voltage_data_device = cl.array.to_device(cl_queue, voltage_data)
 
-        # Create a timing object
-        timing = GPUTiming(name='1st Derivative Kernel')
+        deriv = ElementwiseKernel(cl_context,
+                                  "float dx, float *f, float *dfdx",
+                                  "dfdx[i] = (f[i+1] - f[i])/dx",
+                                  "deriv"
+                                  )
 
-        # GPU Arrays
-        start_t_gpu.record()
+        dfdx_device = cl.array.empty_like(voltage_data_device)
+        exec_evt = deriv(dx, voltage_data_device, dfdx_device)
 
-        voltage_gpu = gpuarray.to_gpu(voltage_data[:-2])
-        voltage_gpu_shifted = gpuarray.to_gpu(voltage_data[1:-1])
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.host_to_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Initialize an empty array on the gpu to hold the derivatives
-        start_t_gpu.record()
-        dfdx_gpu = gpuarray.zeros(n, np.float32)
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.init_on_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Device info
-        # gpu_dev = tools.DeviceData()
-        threads_per_block = 512  # gpu_dev.max_threads
-        n_blocks = int(np.ceil(n / threads_per_block))
-
-        # Run the kernel
-        derivative_kernel = module.get_function("dfdx_shared")
-        start_t_gpu.record()
-        derivative_kernel(voltage_gpu,
-                          voltage_gpu_shifted,
-                          dfdx_gpu,
-                          alpha,
-                          np.int_(n),
-                          block=(threads_per_block, 1, 1),
-                          grid=(n_blocks, 1, 1))
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-        timing.kernel_run_time = start_t_gpu.time_till(end_t_gpu)*1e-3
+        if self.profile:
+            exec_evt.wait()
+            elapsed = 1e-9 * (exec_evt.profile.end - exec_evt.profile.start)
 
         if transfer_to_host:
-            start_t_gpu.record()
-            dfdx_cpu = dfdx_gpu.get()
-            end_t_gpu.record()
-            end_t_gpu.synchronize()
-            timing.device_to_host = start_t_gpu.time_till(end_t_gpu)*1e-3
+            dfdx_cpu = dfdx_device.get()
             return dfdx_cpu, timing
 
         else:
-            return dfdx_gpu, timing
+            return dfdx_device, timing
 
-    def compute_second_deriv_gpu(self, transfer_to_host=False):
-        """
-        Send the raw lead voltages to the gpu and calculate the 2nd derivative
-        :param transfer_to_host: True/False to transfer dfdx to the cpu
-        :return: gpuarray of derivatives (still on gpu), and GPUTiming object
+    def compute_second_deriv_device(self, transfer_to_host=False,
+                                    cl_queue=None,
+                                    cl_context=None):
         """
 
-        # Try to import the pyCUDA module
-        try:
-            from pycuda import driver, compiler, gpuarray, tools, cumath
-            import pycuda.autoinit
-            from pycuda.compiler import SourceModule
+        :param transfer_to_host:
+        :param cl_queue:
+        :param cl_context:
+        :return:
+        """
 
-        except ImportError:
-            print("Error: Unable to import the pyCUDA package")
-            return
+        if cl_queue is None:
+            cl_queue = self.cl_queue
+        if cl_context is None:
+            cl_context = self.cl_context
 
-        module = SourceModule(
-            """
-            // Simple gpu kernel to compute the 2nd derivative
-            // with a constant dx (using shared memory)
-
-            __global__ void d2fdx2(float* f,
-                                          float* f_s,
-                                          float* f_ss,
-                                          float* d2fdx2,
-                                          float alpha,
-                                          int n)
-            {
-                unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-                if (i > n){
-                    return;
-                }
-
-                d2fdx2[i] = alpha * (f[i] - 2 * f_s[i] + f_ss[i]);
-            }
-
-            __global__ void d2fdx2_shared(float* f,
-                                          float* f_s,
-                                          float* f_ss,
-                                          float* d2fdx2,
-                                          float alpha,
-                                          int n)
-            {
-                unsigned int g_i = blockIdx.x * blockDim.x + threadIdx.x;
-                unsigned int s_i = threadIdx.x;
-
-                if (g_i > n){
-                    return;
-                }
-                __shared__ float shared_alpha;
-                __shared__ float shared_f[512];
-                __shared__ float shared_f_s[512];
-                __shared__ float shared_f_ss[512];
-
-                // Assigned to shared memory
-                shared_alpha = alpha;
-                shared_f[s_i] = f[g_i];
-                shared_f_s[s_i] = f_s[g_i];
-                shared_f_ss[s_i] = f_ss[g_i];
-
-                __syncthreads();
-
-                d2fdx2[g_i] = shared_alpha * (shared_f[s_i] - 2 * shared_f_s[s_i] + shared_f_ss[s_i]);
-            }
-            """)
+        if self.profile:
+            timing = DeviceTiming("2nd Derivative - OpenCL")
+        else:
+            timing = None
 
         voltage_data = (self.voltage_data *
-                       (self.resolution / 1000000.0)).astype(np.float32)
+                        (self.resolution / 1000000.0)).astype(np.float32)
 
         dx = self.samples / self.sample_rate / self.samples
-        n = self.voltage_data[2:].size
         alpha = np.float32(1.0 / dx ** 2)
 
-        start_t_gpu = driver.Event()
-        end_t_gpu = driver.Event()
+        if self.profile:
+            s = time.time()
+            voltage_data_device = cl.array.to_device(cl_queue, voltage_data)
+            e = time.time()
+            timing.host_to_device = e - s
+        else:
+            voltage_data_device = cl.array.to_device(cl_queue, voltage_data)
 
-        # Create a timing object
-        timing = GPUTiming(name='2nd Derivative Kernel')
+        deriv = ElementwiseKernel(cl_context,
+                                  "float alpha, float *f, float *dfdx",
+                                  "dfdx[i] = alpha * (f[i] - 2 * f[i+1] + f[i+2])",
+                                  "deriv"
+                                  )
 
-        # GPU Arrays
-        start_t_gpu.record()
+        if self.profile:
+            s = time.time()
+            dfdx_device = cl.array.empty_like(voltage_data_device)
+            e = time.time()
+            timing.init_on_device = e - s
 
-        voltage_gpu = gpuarray.to_gpu(voltage_data[:-2])
-        voltage_gpu_shifted = gpuarray.to_gpu(voltage_data[1:-1])
-        voltage_gpu_shifted_again = gpuarray.to_gpu(voltage_data[2:])
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.host_to_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Initialize an empty array on the gpu to hold the derivatives
-        start_t_gpu.record()
-        df2dx2_gpu = gpuarray.empty(n, np.float32)
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.init_on_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Device info
-        # gpu_dev = tools.DeviceData()
-        threads_per_block = 512  # gpu_dev.max_threads
-        n_blocks = int(np.ceil(n / threads_per_block))
-
-        # Run the kernel
-        derivative_kernel = module.get_function("d2fdx2_shared")
-        start_t_gpu.record()
-        derivative_kernel(voltage_gpu,
-                          voltage_gpu_shifted,
-                          voltage_gpu_shifted_again,
-                          df2dx2_gpu,
-                          alpha,
-                          np.int_(n),
-                          block=(threads_per_block, 1, 1),
-                          grid=(n_blocks, 1, 1))
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-        timing.kernel_run_time = start_t_gpu.time_till(end_t_gpu)*1e-3
+            exec_evt = deriv(alpha, voltage_data_device, dfdx_device)
+            exec_evt.wait()
+            timing.kernel_run_time = 1e-9 * (exec_evt.profile.end - exec_evt.profile.start)
+        else:
+            dfdx_device = cl.array.empty_like(voltage_data_device)
+            exec_evt = deriv(alpha, voltage_data_device, dfdx_device)
 
         if transfer_to_host:
-            start_t_gpu.record()
-            df2dx2_cpu = df2dx2_gpu.get()
-            end_t_gpu.record()
-            end_t_gpu.synchronize()
-            timing.device_to_host = start_t_gpu.time_till(end_t_gpu)*1e-3
-            return df2dx2_cpu, timing
+            if self.profile:
+                s = time.time()
+                dfdx_cpu = dfdx_device.get()
+                e = time.time()
+                timing.device_to_host = e - s
+                return dfdx_cpu, timing
+            else:
+                dfdx_cpu = dfdx_device.get()
+                return dfdx_cpu, timing
 
         else:
-            return df2dx2_gpu, timing
+            return dfdx_device, timing
 
-    def compute_second_deriv_gpu_non_shift(self, transfer_to_host=False):
+
+    def stream_compact_above(self,
+                             threshold_value=None,
+                             gpu_array=None,
+                             transfer_to_host=True):
         """
-        Send the raw lead voltages to the gpu and calculate the 2nd derivative
-        :param transfer_to_host: True/False to transfer dfdx to the cpu
-        :return: gpuarray of derivatives (still on gpu), and GPUTiming object
+
+        :param threshold_value:
+        :param gpu_array: Array with values to threshold
+        :param transfer_to_host: True/False to transfer thresholded to the cpu
+        :return: thresholded array with the index values (i.e. r peaks)
         """
 
-        # Try to import the pyCUDA module
-        try:
-            from pycuda import driver, compiler, gpuarray, tools, cumath
-            import pycuda.autoinit
-            from pycuda.compiler import SourceModule
+        if self.profile:
+            timing = DeviceTiming("Threshold Above - OpenCL")
+        else:
+            timing = None
 
-        except ImportError:
-            print("Error: Unable to import the pyCUDA package")
-            return
+        out, count, event = cl_algorithms.copy_index_if(gpu_array,
 
-        module = SourceModule(
-            """
-            // Simple gpu kernel to compute the 2nd derivative
-            // with a constant dx (using shared memory)
-            __global__ void d2fdx2(float* f,
-                                   float* d2fdx2,
-                                   float alpha,
-                                   int n)
-            {
-                unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-                if ((i > 1) && (i < n))
-                {
-                    d2fdx2[i] = alpha * (f[i+1] - 2 * f[i] + f[i-1]);
-                }
-            }
-            """)
+                                                        "ary[i] > " + str(threshold_value))
+        if self.profile:
+            event.wait()
+            timing.kernel_run_time = 1e-9 * (event.profile.end - event.profile.start)
 
-        voltage_data = (self.voltage_data *
-                       (self.resolution / 1000000.0)).astype(np.float32)
+        # Transfer the size/number of indices
+        c = np.int(count.get())
 
-        dx = self.samples / self.sample_rate / self.samples
-        n = self.voltage_data.size
-        alpha = np.float32(1.0 / dx ** 2)
-
-        start_t_gpu = driver.Event()
-        end_t_gpu = driver.Event()
-
-        # Create a timing object
-        timing = GPUTiming(name='2nd Derivative Kernel - Non Shifted')
-
-        # GPU Arrays
-        start_t_gpu.record()
-
-        voltage_gpu = gpuarray.to_gpu(voltage_data)
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.host_to_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Initialize an empty array on the gpu to hold the derivatives
-        start_t_gpu.record()
-        df2dx2_gpu = gpuarray.empty(n, np.float32)
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.init_on_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Device info
-        # gpu_dev = tools.DeviceData()
-        threads_per_block = 512  # gpu_dev.max_threads
-        n_blocks = int(np.ceil(n / threads_per_block))
-
-        # Run the kernel
-        derivative_kernel = module.get_function("d2fdx2")
-        start_t_gpu.record()
-        derivative_kernel(voltage_gpu,
-                          df2dx2_gpu,
-                          alpha,
-                          np.int_(n),
-                          block=(threads_per_block, 1, 1),
-                          grid=(n_blocks, 1, 1))
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-        timing.kernel_run_time = start_t_gpu.time_till(end_t_gpu)*1e-3
+        thresholded_array = out[:c]
 
         if transfer_to_host:
-            start_t_gpu.record()
-            df2dx2_cpu = df2dx2_gpu.get()
-            end_t_gpu.record()
-            end_t_gpu.synchronize()
-            timing.device_to_host = start_t_gpu.time_till(end_t_gpu)*1e-3
-            return df2dx2_cpu, timing
+            if self.profile:
+                s = time.time()
+                thresholded_array_cpu = thresholded_array.get()
+                e = time.time()
+                timing.device_to_host = e - s
+            else:
+                thresholded_array_cpu = thresholded_array.get()
+
+            return thresholded_array_cpu, timing
 
         else:
-            return df2dx2_gpu, timing
+            return thresholded_array, timing
 
-    def threshold_above_gpu(self,
-                            threshold_value=None,
-                            gpu_array=None,
-                            transfer_to_host=True):
+    def stream_compact_below(self,
+                             threshold_value=None,
+                             gpu_array=None,
+                             transfer_to_host=True):
         """
 
         :param threshold_value:
@@ -452,305 +334,91 @@ class Lead:
         :return:
         """
 
-        # Try to import the pyCUDA module
-        try:
-            from pycuda import driver, compiler, gpuarray, tools, cumath
-            import pycuda.autoinit
-            from pycuda.compiler import SourceModule
+        if self.profile:
+            timing = DeviceTiming("Threshold Below - OpenCL")
+        else:
+            timing = None
 
-        except ImportError:
-            print("Error: Unable to import the pyCUDA package")
-            return
+        out, count, event = cl_algorithms.copy_index_if(gpu_array,
+                                                        "ary[i] < " + str(threshold_value))
+        if self.profile:
+            event.wait()
+            timing.kernel_run_time = 1e-9 * (event.profile.end - event.profile.start)
 
-        module = SourceModule(
-            """
-            // Filter out values that are not big enough
-            // (use for very large derivatives) i.e. large positive spikes
-            __global__ void get_only_large_deriv_shared(float* f,
-                                                        int* thresholded_f,
-                                                        float threshold)
-            {
-                __shared__ float shared_f[512];
-                __shared__ int  shared_thresholded_f[512];
-                //float shared_threshold;
+        # Transfer the size/number of indices
+        c = np.int(count.get())
 
-                unsigned int g_i = blockIdx.x * blockDim.x + threadIdx.x;
-                unsigned int b_i = threadIdx.x;
-
-                //shared_threshold = threshold;
-
-                // Put f into shared memory
-                shared_f[b_i] = f[g_i];
-
-                __syncthreads();
-
-                // 1 if at or above threshold, 0 if not
-                shared_thresholded_f[b_i] = (shared_f[b_i] >= threshold) ? 1 : 0;
-
-                // Put threshold values into global memory
-                thresholded_f[g_i] = shared_thresholded_f[b_i];
-
-            }
-            """)
-
-        n = self.voltage_data[2:].size
-
-        start_t_gpu = driver.Event()
-        end_t_gpu = driver.Event()
-
-        # Create a timing object
-        timing = GPUTiming(name='Threshold Above Kernel')
-
-        # Initialize an empty array on the gpu to hold the derivatives
-        start_t_gpu.record()
-        thresholded_array = gpuarray.empty(n, np.int32)
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.init_on_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Device info
-        # gpu_dev = tools.DeviceData()
-        threads_per_block = 512  # gpu_dev.max_threads
-        n_blocks = int(np.ceil(n / threads_per_block))
-
-        # Run the kernel
-        threshold_kernel = module.get_function("get_only_large_deriv_shared")
-        start_t_gpu.record()
-        threshold_kernel(gpu_array,
-                         thresholded_array,
-                         np.float32(threshold_value),
-                         block=(threads_per_block, 1, 1),
-                         grid=(n_blocks, 1, 1))
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-        timing.kernel_run_time = start_t_gpu.time_till(end_t_gpu)*1e-3
+        thresholded_array = out[:c]
 
         if transfer_to_host:
-            start_t_gpu.record()
-            thresholded_array_cpu = thresholded_array.get()
-            end_t_gpu.record()
-            end_t_gpu.synchronize()
-            timing.device_to_host = start_t_gpu.time_till(end_t_gpu)*1e-3
+            if self.profile:
+                s = time.time()
+                thresholded_array_cpu = thresholded_array.get()
+                e = time.time()
+                timing.device_to_host = e - s
+            else:
+                thresholded_array_cpu = thresholded_array.get()
+
             return thresholded_array_cpu, timing
 
         else:
             return thresholded_array, timing
 
-    def threshold_below_gpu(self,
-                            threshold_value=None,
-                            gpu_array=None,
-                            transfer_to_host=True):
+    def rr_to_hr_device(self,
+                        rr_peaks=None,
+                        transfer_to_host=False,
+                        cl_queue=None,
+                        cl_context=None):
         """
-
-        :param threshold_value:
-        :param gpu_array: Array with values to threshold
-        :param transfer_to_host: True/False to transfer thresholded to the cpu
-        :return:
-        """
-
-        # Try to import the pyCUDA module
-        try:
-            from pycuda import driver, compiler, gpuarray, tools, cumath
-            import pycuda.autoinit
-            from pycuda.compiler import SourceModule
-
-        except ImportError:
-            print("Error: Unable to import the pyCUDA package")
-            return
-
-        module = SourceModule(
-            """
-            // Filter out values that are not big enough
-            // (use for very large derivatives) i.e. large positive spikes
-            __global__ void get_only_small_deriv_shared(float* f,
-                                                        int* thresholded_f,
-                                                        float threshold)
-            {
-                __shared__ float shared_f[512];
-                __shared__ int  shared_thresholded_f[512];
-                //float shared_threshold;
-
-                unsigned int g_i = blockIdx.x * blockDim.x + threadIdx.x;
-                unsigned int b_i = threadIdx.x;
-
-                //shared_threshold = threshold;
-
-                // Put f into shared memory
-                shared_f[b_i] = f[g_i];
-
-                __syncthreads();
-
-                // 1 if at or above threshold, 0 if not
-                shared_thresholded_f[b_i] = (shared_f[b_i] <= threshold) ? 1 : 0;
-
-                // Put threshold values into global memory
-                thresholded_f[g_i] = shared_thresholded_f[b_i];
-
-            }
-            """)
-
-        n = self.voltage_data[2:].size
-
-        start_t_gpu = driver.Event()
-        end_t_gpu = driver.Event()
-
-        # Create a timing object
-        timing = GPUTiming(name='Threshold Below Kernel')
-
-        # Initialize an empty array on the gpu to hold the derivatives
-        start_t_gpu.record()
-        thresholded_array = gpuarray.zeros(n, np.int32)
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.init_on_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Device info
-        # gpu_dev = tools.DeviceData()
-        threads_per_block = 512  # gpu_dev.max_threads
-        n_blocks = np.int_(np.ceil(n / threads_per_block))
-
-        # Run the kernel
-        threshold_kernel = module.get_function("get_only_small_deriv_shared")
-        start_t_gpu.record()
-        threshold_kernel(gpu_array,
-                         thresholded_array,
-                         threshold_value,
-                         block=(threads_per_block, 1, 1),
-                         grid=(n_blocks, 1, 1))
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-        timing.kernel_run_time = start_t_gpu.time_till(end_t_gpu)*1e-3
-
-        if transfer_to_host:
-            start_t_gpu.record()
-            thresholded_array_cpu = thresholded_array.get()
-            end_t_gpu.record()
-            end_t_gpu.synchronize()
-            timing.device_to_host = start_t_gpu.time_till(end_t_gpu)*1e-3
-            return thresholded_array_cpu, timing
-
-        else:
-            return thresholded_array, timing
-
-    @staticmethod
-    def find_r_peaks(r_binary_array=None):
-        """
-        Look for the r peaks in the signal
-        :param r_binary_array: Array that holds 1's or 0's to show where
-        suspected peaks may be
-        :return: array with indices of r peaks
-        """
-
-        # Find the locations of the filtered derivatives,
-        # suspected to be r peaks
-        start_t_cpu = time.clock()
-
-        rr_peaks = np.ascontiguousarray(np.where(r_binary_array != 0)[0])
-
-        end_t_cpu = time.clock()
-        run_time = end_t_cpu - start_t_cpu
-        print("Locate R peaks on CPU: \t\t\t{0:.5f} seconds".format(run_time))
-
-        return rr_peaks, run_time
-
-    def rr_to_hr_gpu(self,
-                     rr_peaks=None,
-                     transfer_to_host=True):
-        """
-
         :param rr_peaks:
         :param transfer_to_host:
+        :param cl_queue:
+        :param cl_context:
         :return:
         """
-        # Try to import the pyCUDA module
-        try:
-            from pycuda import driver, compiler, gpuarray, tools, cumath
-            import pycuda.autoinit
-            from pycuda.compiler import SourceModule
 
-        except ImportError:
-            print("Error: Unable to import the pyCUDA package")
-            return
+        if cl_queue is None:
+            cl_queue = self.cl_queue
+        if cl_context is None:
+            cl_context = self.cl_context
 
-        module = SourceModule(
-            """
-            __global__ void rr_peaks(float* r_peaks,
-                                     float* r_peaks_shifted,
-                                     float* hr,
-                                     float alpha)
-            {
-                unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-                // alpha is 60/dt
-                // hr is the distance between peaks div * 2 / by time
-                // i.e. 2 beats (distance/time) = beats per time
-
-                hr[i] = alpha / (r_peaks_shifted[i] - r_peaks[i]);
-            }
-            """)
-
-        start_t_gpu = driver.Event()
-        end_t_gpu = driver.Event()
-
-        # Create a timing object
-        timing = GPUTiming(name='RR to Heart Rate Kernel')
-
-        # GPU Arrays
-        start_t_gpu.record()
-
-        rr_peaks_gpu = gpuarray.to_gpu(rr_peaks[:-1].astype(np.float32))
-        rr_peaks_gpu_shifted = gpuarray.to_gpu(rr_peaks[1:].astype(np.float32))
-
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.host_to_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Initialize an empty array on the gpu to hold the derivatives
-        start_t_gpu.record()
-        hr_gpu = gpuarray.zeros(rr_peaks.size, np.float32)
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-
-        timing.init_on_device = start_t_gpu.time_till(end_t_gpu) * 1e-3
-
-        # Device info
-        # gpu_dev = tools.DeviceData()
-        threads_per_block = 512  # gpu_dev.max_threads
-        n_blocks = np.int_(np.ceil(rr_peaks.size / threads_per_block))
+        if self.profile:
+            timing = DeviceTiming("RR to Heart Rate - OpenCL")
+        else:
+            timing = None
 
         dx = self.samples / self.sample_rate / self.samples
         alpha = np.float32(60.0 / dx)
 
-        # Run the kernel
-        rr_peaks_kernel = module.get_function("rr_peaks")
-        start_t_gpu.record()
-        rr_peaks_kernel(rr_peaks_gpu,
-                        rr_peaks_gpu_shifted,
-                        hr_gpu,
-                        alpha,
-                        block=(threads_per_block, 1, 1),
-                        grid=(n_blocks, 1, 1))
+        rr_to_hr_kernel = ElementwiseKernel(cl_context,
+                                            "float alpha, float *r_peaks, float *hr",
+                                            "hr[i] = alpha / (r_peaks[i+1] - r_peaks[i])",
+                                            "rr_to_hr_kernel"
+                                            )
 
-        end_t_gpu.record()
-        end_t_gpu.synchronize()
-        timing.kernel_run_time = start_t_gpu.time_till(end_t_gpu)*1e-3
+        # Device array to hold heart rate
+        hr_device = cl.array.empty(cl_queue, shape=rr_peaks.size, dtype=np.float32)
+
+        exec_evt = rr_to_hr_kernel(alpha, rr_peaks, hr_device)
+        if self.profile:
+            exec_evt.wait()
+            timing.kernel_run_time = 1e-9 * (exec_evt.profile.end - exec_evt.profile.start)
 
         if transfer_to_host:
-            start_t_gpu.record()
-            hr_cpu = hr_gpu.get()
-            end_t_gpu.record()
-            end_t_gpu.synchronize()
-            timing.device_to_host = start_t_gpu.time_till(end_t_gpu)*1e-3
+            if self.profile:
+                s = time.time()
+                hr_cpu = hr_device.get()
+                e = time.time()
+                timing.device_to_host = e - s
+            else:
+                hr_cpu = hr_device.get()
+
             return hr_cpu, timing
 
         else:
-            return hr_gpu, timing
+            return hr_device, timing
 
+    @jit(cache=True)
     def threshold_hr_values_cpu(self,
                                 heart_rate_data=None,
                                 r_peak_array=None,
@@ -766,7 +434,8 @@ class Lead:
         :return:
         """
 
-        start_t_cpu = time.clock()
+        if self.profile:
+            start_t_cpu = time.time()
 
         # Find where the heart rate is high enough to be valid
         good_indices = np.where((heart_rate_data >= min_heart_rate) &
@@ -777,18 +446,19 @@ class Lead:
 
         # Loop through the good heart rates
         for i, v in np.ndenumerate(good_indices):
-
             # Get the filtered heart rate value
             filtered_hr[i] = heart_rate_data[good_indices[i]]
 
             # Get the corresponding time that the heart rate occurs
             filtered_t[i] = r_peak_array[good_indices[i]]
 
-        end_t_cpu = time.clock()
+        if self.profile:
+            end_t_cpu = time.time()
+            run_time = end_t_cpu - start_t_cpu
 
-        run_time = end_t_cpu - start_t_cpu
-
-        # print("Heart Rate Filtering on CPU: \t\t{0:.5f} seconds".format(run_time))
+            print("Heart Rate Filtering on CPU: \t\t{0:.5f} seconds".format(run_time))
+        else:
+            run_time = None
 
         # Save it to the object -> array[time, heart_rate at time]
         self.heart_rate = [None, None]
@@ -799,8 +469,14 @@ class Lead:
 
         return run_time
 
-    def threshold_hr_values_gpu(self):
-        pass
+    def get_subset_maximum(self, device_array=None, n_samples=None):
+        """
+        Get a subset maximum (of derivative or something) of a
+        :param n_samples: subset size
+        :param device_array: array to get max of
+        :return:
+        """
+        return pyopencl.array.subset_max(n_samples, device_array, queue=None)
 
     def get_heart_rate(self):
         """
@@ -808,37 +484,69 @@ class Lead:
         :return:
         """
 
-        d2fdx2_gpuarray, deriv_timing = self.compute_second_deriv_gpu(
-            transfer_to_host=False)
+        print("Computing heart rate for lead",self.number, "...")
+
+        # Calculate the first derivative
+        # dfdx_device_array, deriv_timing = self.compute_first_deriv_device(
+            # transfer_to_host=False)
         d2fdx2_max = 18000.0
-        deriv_timing.print_timings()
+        # deriv_timing.print_timings()
 
-        d2fdx2_gpuarray, deriv2_timing = self.compute_second_deriv_gpu_non_shift(
+        # self.voltage_first_derivative = dfdx_device_array.get()
+
+        # Calculate the second derivative
+        d2fdx2_device_array, deriv_timing = self.compute_second_deriv_device(
             transfer_to_host=False)
-        deriv2_timing.print_timings()
 
-        d2fdx2_filtered_gpuarray, thresh_timing = self.threshold_above_gpu(
-                                                threshold_value=d2fdx2_max,
-                                                gpu_array=d2fdx2_gpuarray,
-                                                transfer_to_host=True)
-        thresh_timing.print_timings()
+        if self.profile:
+            deriv_timing.print_timings()
 
-        # # Find the locations of the filtered derivatives, suspected to be r peaks
-        # r_peaks, r_peaks_runtime = self.find_r_peaks(
-        #     r_binary_array=d2fdx2_filtered_gpuarray)
-        #
-        # hr_gpuarray, hr_timing = self.rr_to_hr_gpu(
-        #     rr_peaks=r_peaks, transfer_to_host=True)
-        #
-        # hr_timing.print_timings()
-        #
-        # hr_thresh_time = self.threshold_hr_values_cpu(heart_rate_data=hr_gpuarray,
-        #                                               r_peak_array=r_peaks,
-        #                                               min_heart_rate=30.0,
-        #                                               max_heart_rate=200.0)
-        #
-        # print("Total Time: ", deriv_timing.total_time + thresh_timing.total_time +
-        #       hr_timing.total_time + hr_thresh_time)
+        # ss = np.int64(10)
+        # mx = pyopencl.array.subset_max(ss, d2fdx2_device_array, queue=None)
+        # print('subset max', mx)
+
+        self.voltage_second_derivative = d2fdx2_device_array.get()
+
+        # Stream compact and get the indices of the r peaks
+        r_peaks_device_array, thresh_timing = self.stream_compact_above(
+            threshold_value=d2fdx2_max,
+            gpu_array=d2fdx2_device_array,
+            transfer_to_host=False)
+        if self.profile:
+            thresh_timing.print_timings()
+
+        # Convert the r peaks to heart rate
+        hr_device_array, hr_timing = self.rr_to_hr_device(
+            rr_peaks=r_peaks_device_array,
+            transfer_to_host=True)
+
+        if self.profile:
+            hr_timing.print_timings()
+
+        # Threshold the heart rate values between a range
+        hr_thresh_time = self.threshold_hr_values_cpu(heart_rate_data=hr_device_array,
+                                                      r_peak_array=r_peaks_device_array.get(),
+                                                      min_heart_rate=30.0,
+                                                      max_heart_rate=200.0)
+
+        if self.profile:
+            print()
+            print("Total Transfer Times: \t\t\t{0:.5f} seconds".format(
+                np.nansum([deriv_timing.get_transfer_times(),
+                           thresh_timing.get_transfer_times(),
+                           hr_timing.get_transfer_times()])))
+
+            print("Total Kernel Runtimes: \t\t\t{0:.5f} seconds".format(
+                np.nansum([deriv_timing.kernel_run_time,
+                           thresh_timing.kernel_run_time,
+                           hr_timing.kernel_run_time])))
+
+            print("Total Time: \t\t\t\t{0:.5f} seconds".format(
+                np.nansum([deriv_timing.total_time,
+                           thresh_timing.total_time,
+                           hr_timing.total_time,
+                           hr_thresh_time])))
+            print()
 
     def plot_lead(self, start=0, stop=1000):
         """
@@ -1017,7 +725,8 @@ class Patient:
     Class that handles the patient info and ecg files
     """
 
-    def __init__(self):
+    def __init__(self, ecg_file=None, profile=False):
+        self.profile = profile
         self.magic_number = None
         self.checksum = None
         self.var_length_block_size = None
@@ -1046,7 +755,7 @@ class Patient:
         self.reserved = None
         self.dt = None
         self.var_block = None
-        self.ecg_file = None
+        self.ecg_filename = ecg_file
 
         self.samples_per_lead = None
 
@@ -1064,41 +773,40 @@ class Patient:
         self.dt_datetime = None
         self.heart_rate_computed = {}
 
-    def load_ecg_header(self, filename):
+        #self._get_header_data()
+
+    def load_ecg_header(self):
         """
         Open the ECG file and only read the header
         :param filename: Name of the ECG file
         :return:
         """
 
-
         try:
-            with open(filename, 'rb') as self.ecg_file:
-                print("Reading filename (header only): " + filename)
-
+            with open(self.ecg_filename, 'rb') as f:
                 self._get_header_data()
 
         except IOError:
-            print("File cannot be opened:", filename)
+            print("File cannot be opened:", self.ecg_filename)
 
-    def load_ecg_data(self, filename):
+    def load_ecg_data(self):
         """
         Open the ECG file and read the data
         :param filename: path name of the file to read
         """
 
         try:
-            with open(filename, 'rb')as self.ecg_file:
-                print("Reading filename (header and data): " + filename)
+            with open(self.ecg_filename, 'rb') as f:
+                print("Reading filename (header and data): " + self.ecg_filename)
 
-                self._get_header_data()
+                self._get_header_data(f)
 
                 # Set the data type to load all of the samples in one chunk
                 ecg_dtype = np.dtype([('samples', np.int16, self.n_leads)])
 
                 # Read the file
                 ecg_data = np.fromfile(
-                    self.ecg_file, dtype=ecg_dtype, count=int(self.samples_per_lead))
+                    f, dtype=ecg_dtype, count=int(self.samples_per_lead))
 
                 # Put the ecg data into a dictionary
                 # for index, lead in np.ndenumerate(self.lead_spec):
@@ -1117,7 +825,7 @@ class Patient:
 
                 self.dt_datetime = np.arange(start=t,
                                              stop=t + np.timedelta64(
-                                                  int(self.samples_per_lead) * 5, 'ms'),
+                                                 int(self.samples_per_lead) * 5, 'ms'),
                                              step=np.timedelta64(5, 'ms'))
 
                 for l in self.active_leads:
@@ -1125,65 +833,70 @@ class Patient:
                     self.heart_rate[l] = None
 
                     self.leads.append(
-                            Lead(lead_number=l,
-                                 voltage=ecg_data['samples'][:, l],
-                                 resolution=self.resolution[l],
-                                 sample_rate=self.sampling_rate,
-                                 samples=self.samples_per_lead,
-                                 time_series=self.dt_datetime))
+                        Lead(lead_number=l,
+                             voltage=ecg_data['samples'][:, l],
+                             resolution=self.resolution[l],
+                             sample_rate=self.sampling_rate,
+                             samples=self.samples_per_lead,
+                             time_series=self.dt_datetime,
+                             profile=self.profile))
 
                 self.ecg_data_loaded = True
 
                 self.ecg_time_data = np.linspace(0, self.samples_per_lead / self.sampling_rate,
                                                  num=self.samples_per_lead)
 
-
         except IOError:
-            print("File cannot be opened:", filename)
+            print("File cannot be opened:", self.ecg_filename)
 
-    def _get_header_data(self):
+    def _get_header_data(self, ecg_file_buffer=None):
         self.magic_number = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a8'), count=1)[0]
-        self.checksum = np.fromfile(self.ecg_file, dtype=np.uint16, count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a8'), count=1)[0]
+        self.checksum = np.fromfile(ecg_file_buffer, dtype=np.uint16, count=1)[0]
         self.var_length_block_size = np.fromfile(
-            self.ecg_file, dtype=np.int32, count=1)[0]
+            ecg_file_buffer, dtype=np.int32, count=1)[0]
         self.sample_size_ecg = np.fromfile(
-            self.ecg_file, dtype=np.int32, count=1)[0]
+            ecg_file_buffer, dtype=np.int32, count=1)[0]
         self.offset_var_length_block = np.fromfile(
-            self.ecg_file, dtype=np.int32, count=1)[0]
+            ecg_file_buffer, dtype=np.int32, count=1)[0]
         self.offset_ecg_block = np.fromfile(
-            self.ecg_file, dtype=np.int32, count=1)[0]
+            ecg_file_buffer, dtype=np.int32, count=1)[0]
         self.file_version = np.fromfile(
-            self.ecg_file, dtype=np.int16, count=1)[0]
+            ecg_file_buffer, dtype=np.int16, count=1)[0]
         self.first_name = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a40'), count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a40'), count=1)[0]
         self.last_name = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a40'), count=1)[0]
-        self.ID = np.fromfile(self.ecg_file, dtype=np.dtype('a20'), count=1)[0]
-        self.sex = np.fromfile(self.ecg_file, dtype=np.int16, count=1)[0]
-        self.race = np.fromfile(self.ecg_file, dtype=np.int16, count=1)[0]
-        self.birth_date = np.fromfile(self.ecg_file, dtype=np.int16, count=3)
-        self.record_date = np.fromfile(self.ecg_file, dtype=np.int16, count=3)
-        self.file_date = np.fromfile(self.ecg_file, dtype=np.int16, count=3)
-        self.start_time = np.fromfile(self.ecg_file, dtype=np.int16, count=3)
-        self.n_leads = np.fromfile(self.ecg_file, dtype=np.int16, count=1)[0]
-        self.lead_spec = np.fromfile(self.ecg_file, dtype=np.int16, count=12)
-        self.lead_quality = np.fromfile(self.ecg_file, dtype=np.int16, count=12)
-        self.resolution = np.fromfile(self.ecg_file, dtype=np.int16, count=12)
-        self.pacemaker = np.fromfile(self.ecg_file, dtype=np.int16, count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a40'), count=1)[0]
+        self.ID = np.fromfile(ecg_file_buffer, dtype=np.dtype('a20'), count=1)[0]
+        self.sex = np.fromfile(ecg_file_buffer, dtype=np.int16, count=1)[0]
+        self.race = np.fromfile(ecg_file_buffer, dtype=np.int16, count=1)[0]
+        self.birth_date = np.fromfile(ecg_file_buffer, dtype=np.int16, count=3)
+        self.record_date = np.fromfile(ecg_file_buffer, dtype=np.int16, count=3)
+        self.file_date = np.fromfile(ecg_file_buffer, dtype=np.int16, count=3)
+        self.start_time = np.fromfile(ecg_file_buffer, dtype=np.int16, count=3)
+        self.n_leads = np.fromfile(ecg_file_buffer, dtype=np.int16, count=1)[0]
+        self.lead_spec = np.fromfile(ecg_file_buffer, dtype=np.int16, count=12)
+        self.lead_quality = np.fromfile(ecg_file_buffer, dtype=np.int16, count=12)
+        self.resolution = np.fromfile(ecg_file_buffer, dtype=np.int16, count=12)
+        self.pacemaker = np.fromfile(ecg_file_buffer, dtype=np.int16, count=1)[0]
         self.recorder = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a40'), count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a40'), count=1)[0]
         self.sampling_rate = np.fromfile(
-            self.ecg_file, dtype=np.int16, count=1)[0]
+            ecg_file_buffer, dtype=np.int16, count=1)[0]
         self.proprietary = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a80'), count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a80'), count=1)[0]
         self.copyright = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a80'), count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a80'), count=1)[0]
         self.reserved = np.fromfile(
-            self.ecg_file, dtype=np.dtype('a88'), count=1)[0]
+            ecg_file_buffer, dtype=np.dtype('a88'), count=1)[0]
+
         if self.var_length_block_size > 0:
             self.dt = np.dtype((str, self.var_length_block_size))
-            self.var_block = np.fromfile(self.ecg_file, dtype=self.dt, count=1)[0]
+            # try:
+            self.var_block = np.fromfile(ecg_file_buffer, dtype=self.dt, count=1)[0]
+            # except IndexError:
+            #     pass
+
         self.samples_per_lead = self.sample_size_ecg / self.n_leads
 
     def plot_ecg_leads_voltage(self, leads=None, start=0, stop=600):
@@ -1302,7 +1015,7 @@ class Patient:
 
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        lead_t = start_t_gpu.time_till(end_t_gpu)*1e-3
+        lead_t = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += lead_t
         print("Transfer Lead to GPU: \t\t\t{0:.5f} seconds".format(lead_t))
 
@@ -1319,7 +1032,7 @@ class Patient:
         n_blocks = np.int_(np.ceil(n / threads_per_block))
 
         # CUDA kernels
-        #with open('kernels.cu', 'r') as f:
+        # with open('kernels.cu', 'r') as f:
         module = SourceModule(
             """
             #include <stdio.h>
@@ -1469,7 +1182,7 @@ class Patient:
                           grid=(n_blocks, 1, 1))
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        deriv_t = start_t_gpu.time_till(end_t_gpu)*1e-3
+        deriv_t = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += deriv_t
         print("Derivative GPU Kernel: \t\t\t{0:.5f} seconds".format(deriv_t))
         # print("Done")
@@ -1497,7 +1210,7 @@ class Patient:
 
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        thresh_t = start_t_gpu.time_till(end_t_gpu)*1e-3
+        thresh_t = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += thresh_t
         print("Derivative Filter GPU Kernel: \t\t{0:.5f} seconds".format(thresh_t))
 
@@ -1508,7 +1221,7 @@ class Patient:
 
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        thresh_t_transfer = start_t_gpu.time_till(end_t_gpu)*1e-3
+        thresh_t_transfer = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += thresh_t_transfer
         print("Transfer Filtered Deriv. GPU to CPU: \t{0:.5f} seconds".format(thresh_t_transfer))
 
@@ -1529,10 +1242,9 @@ class Patient:
 
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        thresh_t_transfer = start_t_gpu.time_till(end_t_gpu)*1e-3
+        thresh_t_transfer = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += thresh_t_transfer
         print("Transfer R peaks CPU to GPU: \t\t{0:.5f} seconds".format(thresh_t_transfer))
-
 
         # GPU array to hold the heart rate
         # print("rr_peaks.size", rr_peaks.size)
@@ -1563,7 +1275,7 @@ class Patient:
 
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        rr_t = start_t_gpu.time_till(end_t_gpu)*1e-3
+        rr_t = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += rr_t
         print("Heart Rate Calc GPU Kernel: \t\t{0:.5f} seconds".format(rr_t))
         # print("Done...")
@@ -1582,7 +1294,7 @@ class Patient:
 
         end_t_gpu.record()
         end_t_gpu.synchronize()
-        hr_transfer_to_h = start_t_gpu.time_till(end_t_gpu)*1e-3
+        hr_transfer_to_h = start_t_gpu.time_till(end_t_gpu) * 1e-3
         total_t += hr_transfer_to_h
         print("Transfer HR GPU to CPU: \t\t{0:.5f} seconds".format(hr_transfer_to_h))
 
@@ -1594,7 +1306,6 @@ class Patient:
         filtered_t = np.zeros(good_indices.size, dtype='float32')
 
         for i, v in np.ndenumerate(good_indices):
-
             # Get the filtered heart rate value
             filtered_hr[i] = hr_cpu[good_indices[i]]
 
@@ -1611,7 +1322,7 @@ class Patient:
         self.heart_rate[lead_number][1] = np.copy(filtered_hr)
         self.heart_rate[lead_number][0] = np.copy(filtered_t)
 
-        #print("Done...")
+        # print("Done...")
         # Save it to a file
         np.savez('hr' + str(lead_number) + '.npz', hr=filtered_hr, t=filtered_t)
 
@@ -1696,23 +1407,23 @@ class Patient:
             return
 
         plot_me = False
-        for lead_number in self.active_leads:
-            if self.heart_rate_computed[lead_number] is True:
-                hr = self.heart_rate[lead_number][1]
-                hr_t = self.heart_rate[lead_number][0]
+        for lead in self.leads:
+            if lead.heart_rate_computed is True:
+                hr = lead.heart_rate[1]
+                hr_t = lead.heart_rate[0]
 
-                print("Performing median filter on lead", lead_number, "...")
-                filtered_hr = scipy.signal.medfilt(hr, (125,))
+                print("Performing median filter on lead", lead.number, "...")
+                filtered_hr = scipy.signal.medfilt(hr, (51,))
                 print("Done")
 
-                plt.plot(hr_t, filtered_hr, label='lead ' + str(lead_number))
+                plt.plot(hr_t[:-20], filtered_hr[:-20], label='lead ' + str(lead.number))
                 plt.title('Heart Rate (BPM) vs Time')
                 plt.xlabel('Time')
                 plt.ylabel('BPM')
                 plt.legend()
                 plot_me = True
             else:
-                print("Heart rate data not computed for lead", lead_number)
+                print("Heart rate data not computed for lead", lead.number)
 
         if plot_me:
             plt.show()
@@ -1726,18 +1437,18 @@ class Patient:
         for i, value in np.ndenumerate(ary):
             a_i = i[0]
             if a_i > 0:
-                distances[a_i-1] = ary[a_i] - ary[a_i-1]
+                distances[a_i - 1] = ary[a_i] - ary[a_i - 1]
 
-        hist, bins = np.histogram(distances, bins=20, range=(0,200))
-        #print('bins',bins)
-        #print('hist', hist)
-        #print('max hist', np.max(hist), 'at index', np.argmax(hist[1:]), 'value',bins[np.argmax(hist[1:])])
+        hist, bins = np.histogram(distances, bins=20, range=(0, 200))
+        # print('bins',bins)
+        # print('hist', hist)
+        # print('max hist', np.max(hist), 'at index', np.argmax(hist[1:]), 'value',bins[np.argmax(hist[1:])])
 
-        #width = 0.7 * (bins[1] - bins[0])
-        #center = (bins[:-1] + bins[1:]) / 2
-        #plt.bar(center, hist, align='center', width=width)
-        #plt.show()
-        #mu, sigma = np.mean(distances), np.std(distances)
+        # width = 0.7 * (bins[1] - bins[0])
+        # center = (bins[:-1] + bins[1:]) / 2
+        # plt.bar(center, hist, align='center', width=width)
+        # plt.show()
+        # mu, sigma = np.mean(distances), np.std(distances)
 
         return bins[np.argmax(hist[1:])]
 
@@ -1764,7 +1475,6 @@ class Patient:
 
         for i in self.active_leads:
             bp.line(y=self.ecg_lead_derivatives[i][s_interval:e_interval],
-                    x=self.ecg_time_data[s_interval+1:e_interval + 1],
+                    x=self.ecg_time_data[s_interval + 1:e_interval + 1],
                     line_color=palette[i])
         show(bp)
-
